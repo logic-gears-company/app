@@ -10,6 +10,7 @@ import 'package:sqlite3/sqlite3.dart' as sqlite;
 import 'package:uuid/uuid.dart';
 
 import '../models/chat_message.dart';
+import '../models/token_usage.dart';
 import '../models/conversation.dart';
 import '../models/message_part.dart';
 import '../utils/multimodal_input_utils.dart';
@@ -3501,9 +3502,9 @@ class ChatDatabaseRepository {
         COALESCE(SUM(m.prompt_tokens), 0) AS input_tokens,
         COALESCE(SUM(m.completion_tokens), 0) AS output_tokens,
         COALESCE(SUM(m.cached_tokens), 0) AS cached_tokens,
-        COALESCE(SUM(CASE WHEN COALESCE(m.prompt_tokens, 0) = 0
-          AND COALESCE(m.completion_tokens, 0) = 0
-          THEN COALESCE(m.total_tokens, 0) ELSE 0 END), 0) AS uncategorized_tokens
+        COALESCE(SUM(MAX(COALESCE(m.total_tokens, 0)
+          - COALESCE(m.prompt_tokens, 0)
+          - COALESCE(m.completion_tokens, 0), 0)), 0) AS uncategorized_tokens
       FROM message_rows m
       WHERE m.timestamp >= ? AND m.timestamp < ?
         AND (NULLIF(TRIM(m.provider_id), '') IS NOT NULL
@@ -3521,11 +3522,17 @@ class ChatDatabaseRepository {
         .get();
 
     final modelRows = await _db.customSelect('''
-      SELECT m.model_id AS id, MIN(m.provider_id) AS provider_id,
-        COUNT(*) AS item_count
+      SELECT m.model_id AS id, NULLIF(TRIM(m.provider_id), '') AS provider_id,
+        COUNT(*) AS item_count,
+        COALESCE(SUM(m.prompt_tokens), 0) AS input_tokens,
+        COALESCE(SUM(m.completion_tokens), 0) AS output_tokens,
+        COALESCE(SUM(m.cached_tokens), 0) AS cached_tokens,
+        COALESCE(SUM(CAST(json_extract(m.extras_json, '\$."tokens.cacheWrite"')
+          AS INTEGER)), 0) AS cache_write_tokens
       FROM message_rows m
       WHERE NULLIF(TRIM(m.model_id), '') IS NOT NULL $rangeWhere
-      GROUP BY m.model_id ORDER BY item_count DESC, id;
+      GROUP BY m.model_id, NULLIF(TRIM(m.provider_id), '')
+      ORDER BY item_count DESC, id, provider_id;
     ''', variables: rangeVariables).get();
     final topicRows = await _db.customSelect('''
       SELECT c.id AS id, c.title AS label, COUNT(*) AS item_count
@@ -3580,6 +3587,10 @@ class ChatDatabaseRepository {
             label: row.read<String>('id'),
             count: row.read<int>('item_count'),
             providerId: row.readNullable<String>('provider_id'),
+            inputTokens: row.read<int>('input_tokens'),
+            outputTokens: row.read<int>('output_tokens'),
+            cachedTokens: row.read<int>('cached_tokens'),
+            cacheWriteTokens: row.read<int>('cache_write_tokens'),
           ),
       ],
       assistants: [
@@ -4475,6 +4486,20 @@ class ChatDatabaseRepository {
         sourceRow,
         includeMessageIds: false,
       );
+      var suggestions = const <String>[];
+      if (source.chatSuggestions.isNotEmpty &&
+          target.role == 'assistant' &&
+          !target.isStreaming) {
+        // Suggestions belong to the selected reply at the conversation tail.
+        final tail = await loadLinearMessageWindow(
+          conversationId: sourceId,
+          limit: 1,
+        );
+        if (tail.slots.isNotEmpty &&
+            tail.slots.single.revisionId == targetRevisionId) {
+          suggestions = List<String>.of(source.chatSuggestions);
+        }
+      }
       final keptSourceGroupIds = {
         for (final row in kept) row.groupId ?? row.id,
       };
@@ -4497,6 +4522,7 @@ class ChatDatabaseRepository {
                 updatedAt: now,
                 assistantId: assistantId,
                 versionSelections: selections,
+                chatSuggestions: suggestions,
                 messageIds: [
                   for (final message in kept) messageIdMap[message.id]!,
                 ],
@@ -5937,9 +5963,24 @@ class ChatDatabaseRepository {
   }
 
   Future<void> _updateMessageRow(ChatMessage message) async {
+    final current = await (_db.select(
+      _db.messageRows,
+    )..where((t) => t.id.equals(message.id))).getSingleOrNull();
     await (_db.update(
       _db.messageRows,
-    )..where((t) => t.id.equals(message.id))).write(_messageUpdate(message));
+    )..where((t) => t.id.equals(message.id))).write(
+      _messageUpdate(message).copyWith(
+        extrasJson: Value(
+          _encodeTokenExtras(
+            current?.extrasJson ?? '{}',
+            reasoningTokens: message.reasoningTokens,
+            cacheWriteTokens: message.cacheWriteTokens,
+            finishUsage: message.finishUsage,
+            firstTokenMs: message.firstTokenMs,
+          ),
+        ),
+      ),
+    );
   }
 
   /// Partial-column UPDATE: only the non-null fields are written, so
@@ -5963,6 +6004,8 @@ class ChatDatabaseRepository {
     int? completionTokens,
     int? cachedTokens,
     int? durationMs,
+    int? reasoningTokens,
+    int? cacheWriteTokens,
   }) {
     final companion = MessageRowsCompanion(
       updatedAt: Value(DateTime.now().toUtc()),
@@ -5996,9 +6039,26 @@ class ChatDatabaseRepository {
       durationMs: durationMs != null ? Value(durationMs) : const Value.absent(),
     );
     return _db.transaction(() async {
+      var write = companion;
+      if (reasoningTokens != null || cacheWriteTokens != null) {
+        final current = await (_db.select(
+          _db.messageRows,
+        )..where((t) => t.id.equals(messageId))).getSingleOrNull();
+        if (current != null) {
+          write = companion.copyWith(
+            extrasJson: Value(
+              _encodeTokenExtras(
+                current.extrasJson,
+                reasoningTokens: reasoningTokens,
+                cacheWriteTokens: cacheWriteTokens,
+              ),
+            ),
+          );
+        }
+      }
       await (_db.update(
         _db.messageRows,
-      )..where((t) => t.id.equals(messageId))).write(companion);
+      )..where((t) => t.id.equals(messageId))).write(write);
       final updated = await getMessage(messageId);
       if (updated == null) return null;
       if (content == null && reasoningText == null && parts == null) {
@@ -7024,6 +7084,7 @@ class ChatDatabaseRepository {
     final reasoningParts = parts.whereType<ReasoningPart>().toList(
       growable: false,
     );
+    final extras = _decodeExtrasJson(row.extrasJson);
     return ChatMessage(
       id: row.id,
       role: row.role,
@@ -7047,6 +7108,14 @@ class ChatDatabaseRepository {
       completionTokens: row.completionTokens,
       cachedTokens: row.cachedTokens,
       durationMs: row.durationMs,
+      firstTokenMs: _tokenExtraInt(extras, _firstTokenMsExtraKey),
+      reasoningTokens: _tokenExtraInt(extras, _reasoningTokensExtraKey),
+      cacheWriteTokens: _tokenExtraInt(extras, _cacheWriteTokensExtraKey),
+      finishUsage: extras[_finishUsageExtraKey] is Map
+          ? TokenUsage.fromJson(
+              Map<String, dynamic>.from(extras[_finishUsageExtraKey] as Map),
+            )
+          : null,
     );
   }
 
@@ -7292,6 +7361,15 @@ class ChatDatabaseRepository {
       completionTokens: Value(message.completionTokens),
       cachedTokens: Value(message.cachedTokens),
       durationMs: Value(message.durationMs),
+      extrasJson: Value(
+        _encodeTokenExtras(
+          '{}',
+          reasoningTokens: message.reasoningTokens,
+          cacheWriteTokens: message.cacheWriteTokens,
+          finishUsage: message.finishUsage,
+          firstTokenMs: message.firstTokenMs,
+        ),
+      ),
       messageOrder: messageOrder,
     );
   }
@@ -7342,7 +7420,53 @@ class ChatDatabaseRepository {
     return Conversation.decodeExtras(raw);
   }
 
+  static const _reasoningTokensExtraKey = 'tokens.reasoning';
+  static const _cacheWriteTokensExtraKey = 'tokens.cacheWrite';
+  static const _finishUsageExtraKey = 'tokens.finish';
+  static const _firstTokenMsExtraKey = 'timing.firstTokenMs';
+
+  int? _tokenExtraInt(Map<String, dynamic> extras, String key) {
+    final value = extras[key];
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+
+  String _encodeTokenExtras(
+    String existing, {
+    int? reasoningTokens,
+    int? cacheWriteTokens,
+    TokenUsage? finishUsage,
+    int? firstTokenMs,
+  }) {
+    final extras = Map<String, dynamic>.from(_decodeExtrasJson(existing));
+    if (reasoningTokens != null) {
+      extras[_reasoningTokensExtraKey] = reasoningTokens;
+    }
+    if (cacheWriteTokens != null) {
+      extras[_cacheWriteTokensExtraKey] = cacheWriteTokens;
+    }
+    if (finishUsage != null) {
+      extras[_finishUsageExtraKey] = finishUsage.toJson();
+    }
+    if (firstTokenMs != null) {
+      extras[_firstTokenMsExtraKey] = firstTokenMs;
+    }
+    if (extras.isEmpty) return '{}';
+    return jsonEncode(extras);
+  }
+
   // —— Memory system V1 read path (§13.3) ——
+
+  /// Read one consistent set of inputs for prompt injection and usage caching.
+  Future<({List<UserProfileField> profile, List<MemoryEntry> memories})>
+  readMemorySnapshotData({required String assistantId}) => _db.transaction(
+    () async => (
+      profile: await readProfileFields(),
+      memories: await queryVisibleMemories(assistantId: assistantId),
+    ),
+  );
 
   /// Visible memories for [assistantId]: `status='active'` (unless
   /// [includeArchived]) and `(scope='global' OR (scope='assistant' AND
@@ -8010,11 +8134,19 @@ final class ChatStatsRank {
     required this.label,
     required this.count,
     this.providerId,
+    this.inputTokens = 0,
+    this.outputTokens = 0,
+    this.cachedTokens = 0,
+    this.cacheWriteTokens = 0,
   });
   final String id;
   final String label;
   final int count;
   final String? providerId;
+  final int inputTokens;
+  final int outputTokens;
+  final int cachedTokens;
+  final int cacheWriteTokens;
 }
 
 final class ChatStatsAggregate {

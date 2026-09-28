@@ -2,6 +2,7 @@ import 'package:hive/hive.dart';
 import 'package:uuid/uuid.dart';
 
 import 'message_part.dart';
+import 'token_usage.dart';
 
 part 'chat_message.g.dart';
 
@@ -84,6 +85,28 @@ class ChatMessage extends HiveObject {
   @HiveField(19)
   final int? durationMs;
 
+  /// Request start to first streamed output, including reasoning or tool input.
+  /// Null when first-token timing was not observed (for example, non-streaming).
+  final int? firstTokenMs;
+
+  @HiveField(20)
+  final int? reasoningTokens;
+
+  @HiveField(21)
+  final int? cacheWriteTokens;
+
+  /// Latest API request only; the scalar token fields contain the whole turn.
+  final TokenUsage? finishUsage;
+
+  TokenUsage get tokenUsage => TokenUsage(
+    promptTokens: promptTokens,
+    completionTokens: completionTokens,
+    cachedTokens: cachedTokens,
+    reasoningTokens: reasoningTokens,
+    cacheWriteTokens: cacheWriteTokens,
+    totalTokens: totalTokens,
+  );
+
   ChatMessage({
     String? id,
     required this.role,
@@ -106,6 +129,10 @@ class ChatMessage extends HiveObject {
     this.completionTokens,
     this.cachedTokens,
     this.durationMs,
+    this.firstTokenMs,
+    this.reasoningTokens,
+    this.cacheWriteTokens,
+    this.finishUsage,
   }) : parts = List<MessagePart>.unmodifiable(
          parts ?? <MessagePart>[TextPart(content ?? '')],
        ),
@@ -270,6 +297,10 @@ class ChatMessage extends HiveObject {
     int? completionTokens,
     int? cachedTokens,
     int? durationMs,
+    int? firstTokenMs,
+    int? reasoningTokens,
+    int? cacheWriteTokens,
+    TokenUsage? finishUsage,
   }) {
     final List<MessagePart>? nextParts;
     if (parts != null) {
@@ -301,6 +332,10 @@ class ChatMessage extends HiveObject {
       completionTokens: completionTokens ?? this.completionTokens,
       cachedTokens: cachedTokens ?? this.cachedTokens,
       durationMs: durationMs ?? this.durationMs,
+      firstTokenMs: firstTokenMs ?? this.firstTokenMs,
+      reasoningTokens: reasoningTokens ?? this.reasoningTokens,
+      cacheWriteTokens: cacheWriteTokens ?? this.cacheWriteTokens,
+      finishUsage: finishUsage ?? this.finishUsage,
     );
   }
 
@@ -331,6 +366,10 @@ class ChatMessage extends HiveObject {
       'completionTokens': completionTokens,
       'cachedTokens': cachedTokens,
       'durationMs': durationMs,
+      'firstTokenMs': firstTokenMs,
+      'reasoningTokens': reasoningTokens,
+      'cacheWriteTokens': cacheWriteTokens,
+      if (finishUsage != null) 'finishUsage': finishUsage!.toJson(),
     };
   }
 
@@ -384,6 +423,14 @@ class ChatMessage extends HiveObject {
       completionTokens: json['completionTokens'] as int?,
       cachedTokens: json['cachedTokens'] as int?,
       durationMs: json['durationMs'] as int?,
+      firstTokenMs: json['firstTokenMs'] as int?,
+      reasoningTokens: json['reasoningTokens'] as int?,
+      cacheWriteTokens: json['cacheWriteTokens'] as int?,
+      finishUsage: json['finishUsage'] is Map
+          ? TokenUsage.fromJson(
+              Map<String, dynamic>.from(json['finishUsage'] as Map),
+            )
+          : null,
     );
   }
 }

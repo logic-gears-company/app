@@ -1,3 +1,4 @@
+import '../../custom_request_merger.dart';
 import '../../../models/provider_oauth.dart';
 import '../../auth/claude_oauth_request.dart';
 import 'dart:async';
@@ -7,12 +8,15 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 
 import '../../../models/token_usage.dart';
-import '../../../providers/model_provider.dart';
+import '../../../models/model_spec.dart';
 import '../../../providers/settings_provider.dart';
 import '../../../utils/multimodal_input_utils.dart';
 import '../../../../utils/mcp_structured_image.dart';
 import '../builtin_tools.dart';
 import '../chat_api_helpers.dart';
+import '../tool_result_content.dart';
+import '../../model_spec/model_spec_resolver.dart';
+import '../reasoning/reasoning_dialects.dart';
 import '../generation/tool_loop_runner.dart';
 import '../stream/sse_framing.dart';
 import '../stream/stream_chunk.dart';
@@ -29,24 +33,13 @@ export 'claude/claude_history.dart'
         isClaudeSupportedImageMime,
         claudeToolResultContent;
 
-int _defaultClaudeMaxOutputTokens(String modelId) {
-  final lower = modelId.trim().toLowerCase();
-  if (RegExp(
-    r'claude-(?:fable-5|mythos-5|opus-(?:5|4-8)|sonnet-5)(?:$|[._:@/-])',
-    caseSensitive: false,
-  ).hasMatch(lower)) {
-    return 128000;
-  }
-  return 64000;
-}
-
 Stream<StreamChunk> sendClaudeStream(
   http.Client client,
   ProviderConfig config,
   String modelId,
   List<Map<String, dynamic>> messages, {
   List<String>? userImagePaths,
-  int? thinkingBudget,
+  ReasoningRequest reasoning = ReasoningRequest.auto,
   double? temperature,
   double? topP,
   int? maxTokens,
@@ -66,10 +59,6 @@ Stream<StreamChunk> sendClaudeStream(
       : config.baseUrl;
   final url = Uri.parse('$base/messages');
 
-  final isReasoning = effectiveModelInfo(
-    config,
-    modelId,
-  ).abilities.contains(ModelAbility.reasoning);
   final skipRedactedThinkingBlocks = BuiltInToolsHelper.isOpenRouterProvider(
     config,
   );
@@ -99,10 +88,15 @@ Stream<StreamChunk> sendClaudeStream(
     );
   }
 
+  final canImageInput = ModelSpecResolver.instance
+      .spec(config, modelId)
+      .input
+      .contains(Modality.image);
   final history = ClaudeHistory(
     replayServerToolBlocks: replayServerToolBlocks,
     skipRedactedThinkingBlocks: skipRedactedThinkingBlocks,
     skipImageParsing: skipImageParsing,
+    canImageInput: canImageInput,
     userImagePaths: userImagePaths,
   );
   final initialMessages = await history.build(nonSystemMessages);
@@ -330,59 +324,41 @@ Stream<StreamChunk> sendClaudeStream(
   yield* runProviderToolRounds(
     retryRound: retryRound,
     sendRound: () async* {
-      final omitSamplingParams = claudeShouldOmitSamplingParams(
-        upstreamModelId,
-        thinkingBudget,
-      );
-      final compatibleTopP = claudeCompatibleTopP(
-        upstreamModelId,
-        thinkingBudget,
-        topP,
-      );
-      final thinkingModelId = config.oauthProvider == OAuthProvider.kimi
-          ? modelId
-          : upstreamModelId;
-      final thinking = isReasoning
-          ? claudeThinkingConfig(
-              thinkingModelId,
-              thinkingBudget,
-              config: config,
-            )
-          : null;
-      final outputConfig = isReasoning
-          ? claudeOutputConfig(thinkingModelId, thinkingBudget, config: config)
-          : null;
-
-      // Prepare request body per round
+      totalUsage = null;
+      final spec = ModelSpecResolver.instance.spec(config, modelId);
       final body = <String, dynamic>{
         'model': upstreamModelId,
-        'max_tokens':
-            maxTokens ??
-            (config.oauthProvider == OAuthProvider.kimi
-                ? 32000
-                : _defaultClaudeMaxOutputTokens(upstreamModelId)),
-        'messages': convo,
-        'stream': stream,
-        if (systemPrompt.isNotEmpty) 'system': systemPrompt,
+        'max_tokens': maxTokens ?? spec.maxOutput ?? 64000,
         if (config.claudePromptCachingEnabled == true)
           'cache_control': ProviderConfig.claudePromptCacheControl(
             config.claudePromptCachingTtl,
           ),
-        if (!omitSamplingParams &&
-            !isClaudeReasoningEnabled(thinkingBudget) &&
-            temperature != null)
-          'temperature': temperature,
-        if (compatibleTopP != null) 'top_p': compatibleTopP,
+        if (systemPrompt.isNotEmpty) 'system': systemPrompt,
+        'messages': convo,
+        'stream': stream,
+        if (temperature != null) 'temperature': temperature,
+        if (topP != null) 'top_p': topP,
         if (allTools.isNotEmpty) 'tools': allTools,
         if (allTools.isNotEmpty) 'tool_choice': {'type': 'auto'},
-        if (thinking != null) 'thinking': thinking,
-        if (outputConfig != null) 'output_config': outputConfig,
         if (hasCodeExecution && container != null) 'container': container!.id,
       };
+      applyReasoning(
+        body,
+        spec,
+        reasoning,
+        transport: ReasoningTransport.anthropicMessages,
+      );
+      final resolution = resolveReasoning(spec, reasoning);
+      applySamplingPolicy(
+        body,
+        spec,
+        resolution,
+        transport: ReasoningTransport.anthropicMessages,
+      );
+      // Custom body keys win over the reasoning dialect.
       final extraClaude = customBody(config, modelId, assistantBody: extraBody);
-      if (extraClaude.isNotEmpty) {
-        body.addAll(extraClaude);
-      }
+      CustomRequestMerger.applyBody(body, extraClaude);
+      applyAnthropicMessagesProtocolConstraints(body);
 
       http.Request buildRequest() {
         final request = http.Request('POST', url);
@@ -425,9 +401,8 @@ Stream<StreamChunk> sendClaudeStream(
         try {
           final u = (obj['usage'] as Map?)?.cast<String, dynamic>();
           if (u != null) {
-            totalUsage = (totalUsage ?? const TokenUsage()).merge(
-              claudeUsageFromMap(u),
-            );
+            final next = claudeUsageFromMap(u);
+            if (next.hasReportedTokens) totalUsage = next.asSnapshot();
           }
         } catch (_) {}
         container =
@@ -586,7 +561,10 @@ Stream<StreamChunk> sendClaudeStream(
                 if (resultChunk is ToolCallResult) {
                   decoder.recordToolResult(
                     tool.id,
-                    (resultChunk.output ?? '').toString(),
+                    ClientToolResult(
+                      (resultChunk.output ?? '').toString(),
+                      metadata: resultChunk.metadata,
+                    ),
                   );
                 }
                 yield resultChunk;
@@ -641,20 +619,25 @@ Stream<StreamChunk> sendClaudeStream(
           ),
       ];
       for (final tool in decoder.clientTools.values) {
-        var res = toolResultsContent[tool.id] ?? '';
-        if (res.isEmpty && onToolCall != null) {
+        var res = toolResultsContent[tool.id];
+        if (res == null && onToolCall != null) {
           res = ClientToolResult.fromHandler(
             await onToolCall(
               tool.name,
               tool.decodedArguments,
               toolCallId: tool.id,
             ),
-          ).content;
+          );
         }
         lastStreamResults.add({
           'type': 'tool_result',
           'tool_use_id': tool.id,
-          'content': claudeToolResultContent(res),
+          'content': (await ToolResultContent.read(
+            tool.name,
+            res?.content ?? '',
+            metadata: res?.metadata,
+            canImageInput: canImageInput,
+          )).claudeContent,
         });
       }
     },
@@ -663,7 +646,7 @@ Stream<StreamChunk> sendClaudeStream(
     executeAfterRound: !stream,
     emitCalls: !stream,
     onToolCall: onToolCall,
-    append: (executed) {
+    append: (executed) async {
       if (pauseTurn) {
         convo = [
           ...convo,
@@ -678,7 +661,12 @@ Stream<StreamChunk> sendClaudeStream(
                 <String, dynamic>{
                   'type': 'tool_result',
                   'tool_use_id': item.call.id,
-                  'content': claudeToolResultContent(item.content),
+                  'content': (await ToolResultContent.read(
+                    item.call.name,
+                    item.content,
+                    metadata: item.metadata,
+                    canImageInput: canImageInput,
+                  )).claudeContent,
                 },
             ];
       convo = [

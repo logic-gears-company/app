@@ -11,10 +11,11 @@ import '../../../core/models/message_part.dart';
 import '../../../utils/app_directories.dart';
 import '../../../utils/sandbox_path_resolver.dart';
 import '../../../core/models/conversation.dart';
-import '../../../core/models/token_usage.dart';
 import '../../../core/providers/assistant_provider.dart';
 import '../../../core/providers/settings_provider.dart';
+import '../../../core/models/reasoning_request.dart';
 import '../../../core/services/api/chat_api_service.dart';
+import '../../../core/services/api/reasoning/reasoning_selection.dart';
 import '../../../core/services/api/retry_policy.dart';
 import '../../../core/services/api/stream/stream_chunk.dart';
 import '../../../core/services/chat/chat_service.dart';
@@ -25,6 +26,7 @@ import '../../../utils/assistant_regex.dart';
 import '../../../core/models/assistant_regex.dart';
 import '../services/ask_user_interaction_service.dart';
 import '../../chat/utils/thinking_tag_parser.dart';
+import '../services/context_usage_service.dart';
 import '../services/message_generation_service.dart';
 import '../services/tool_approval_service.dart';
 import 'active_streaming_message_store.dart';
@@ -33,15 +35,6 @@ import 'generation_controller.dart';
 import 'home_view_model.dart';
 import 'latest_wins_checkpoint_writer.dart';
 import 'stream_controller.dart' as stream_ctrl;
-
-/// Raised when the generation context carries audio the target model cannot
-/// read. Its [toString] is the error code the UI localizes.
-final class UnsupportedAudioAttachmentException implements Exception {
-  const UnsupportedAudioAttachmentException();
-
-  @override
-  String toString() => 'audio_attachment_unsupported';
-}
 
 final class _BarrierStreamSubscription<T> implements StreamSubscription<T> {
   _BarrierStreamSubscription(this._delegate, this._cancelWithBarrier);
@@ -178,6 +171,7 @@ class ChatActions {
     required this.messageGenerationService,
     required this.contextProvider,
     required this.viewModel,
+    this.contextUsage,
     MobileBackgroundCoordinator? backgroundCoordinator,
   }) : _background =
            backgroundCoordinator ?? MobileBackgroundCoordinator.instance {
@@ -257,6 +251,7 @@ class ChatActions {
   final GenerationController generationController;
   final MessageGenerationService messageGenerationService;
   final BuildContext contextProvider;
+  final ContextUsageService? contextUsage;
 
   // ============================================================================
   // Callbacks for UI updates (set by HomeViewModel)
@@ -501,15 +496,6 @@ class ChatActions {
     );
   }
 
-  /// Elapsed milliseconds since [start], or null when unknown or when a
-  /// device clock rollback made the difference negative (the message_rows
-  /// CHECK constraint rejects negative durations).
-  int? _elapsedMsFrom(DateTime? start) {
-    if (start == null) return null;
-    final elapsed = DateTime.now().difference(start).inMilliseconds;
-    return elapsed < 0 ? null : elapsed;
-  }
-
   ChatMessage _streamingMessageSnapshot(stream_ctrl.StreamingState state) {
     final messageId = state.messageId;
     final index = _messages.indexWhere((message) => message.id == messageId);
@@ -519,11 +505,14 @@ class ChatActions {
     return base.copyWith(
       parts: _assistantPartsForState(state),
       totalTokens: state.totalTokens,
-      promptTokens: state.usage?.promptTokens,
-      completionTokens: state.usage?.completionTokens,
-      cachedTokens: state.usage?.cachedTokens,
-      // copyWith keeps base.durationMs when this resolves to null.
-      durationMs: _elapsedMsFrom(state.streamStartedAt),
+      promptTokens: state.totalUsage?.promptTokens,
+      completionTokens: state.totalUsage?.completionTokens,
+      cachedTokens: state.totalUsage?.cachedTokens,
+      reasoningTokens: state.totalUsage?.reasoningTokens,
+      cacheWriteTokens: state.totalUsage?.cacheWriteTokens,
+      finishUsage: state.usage,
+      durationMs: state.durationMs,
+      firstTokenMs: state.firstTokenMs,
     );
   }
 
@@ -747,8 +736,22 @@ class ChatActions {
     return generationController.isReasoningModel(providerKey, modelId);
   }
 
-  bool _isReasoningEnabled(int? budget) {
-    return messageGenerationService.isReasoningEnabled(budget);
+  bool _isReasoningEnabled(ReasoningRequest request) {
+    return messageGenerationService.isReasoningEnabled(request);
+  }
+
+  ReasoningRequest _selectedReasoning({
+    required SettingsProvider settings,
+    required String providerKey,
+    required String modelId,
+    Assistant? assistant,
+  }) {
+    return selectReasoningRequest(
+      settings: settings,
+      config: settings.getProviderConfig(providerKey),
+      modelId: modelId,
+      assistant: assistant,
+    );
   }
 
   Conversation _conversationForMessageContext(
@@ -857,11 +860,15 @@ class ChatActions {
   Future<void> debugHandleStreamChunk(
     StreamChunk chunk,
     stream_ctrl.StreamingState state,
-  ) => _handleStreamChunk(chunk, state);
+  ) {
+    state.recordFirstOutput(chunk);
+    return _handleStreamChunk(chunk, state);
+  }
 
   @visibleForTesting
   static StreamSubscription<T> listenSequentiallyToStream<T>({
     required Stream<T> stream,
+    void Function(T chunk)? onReceived,
     required Future<void> Function(T chunk) onData,
     required Future<void> Function(Object error, StackTrace stackTrace) onError,
     required Future<void> Function() onDone,
@@ -952,6 +959,8 @@ class ChatActions {
     sourceSubscription = stream.listen(
       (chunk) {
         if (terminalQueued) return;
+        // Synchronous arrival observers must run before any queued async work.
+        onReceived?.call(chunk);
         enqueue((data: chunk, error: null, stackTrace: null, done: false));
       },
       onError: (Object error, StackTrace stackTrace) {
@@ -980,55 +989,6 @@ class ChatActions {
         await drainFuture;
       }
     });
-  }
-
-  bool _supportsAudioAttachmentsForProvider(
-    SettingsProvider settings, {
-    required String providerKey,
-    required String modelId,
-  }) {
-    return messageGenerationService.supportsAudioAttachmentsForProvider(
-      settings,
-      providerKey: providerKey,
-      modelId: modelId,
-    );
-  }
-
-  bool _hasUnsupportedAudioAttachments({
-    required List<ChatMessage> messages,
-    required Conversation conversation,
-    required SettingsProvider settings,
-    required String providerKey,
-    required String modelId,
-    ChatInputData? pendingInput,
-    int? maxRawTruncateIndex,
-  }) {
-    if (_supportsAudioAttachmentsForProvider(
-      settings,
-      providerKey: providerKey,
-      modelId: modelId,
-    )) {
-      return false;
-    }
-
-    if (pendingInput != null &&
-        messageGenerationService.inputContainsAudioAttachments(pendingInput)) {
-      return true;
-    }
-
-    final apiMessages = messageGenerationService.messageBuilderService
-        .buildApiMessages(
-          messages: messages,
-          versionSelections: _versionSelections,
-          currentConversation: _conversationForMessageContext(
-            conversation,
-            messages,
-            maxRawTruncateIndex: maxRawTruncateIndex,
-          ),
-        );
-    return messageGenerationService.apiMessagesContainAudioAttachments(
-      apiMessages,
-    );
   }
 
   @visibleForTesting
@@ -1254,19 +1214,6 @@ class ChatActions {
       }
     }
 
-    // Only the pending input is screened here: it needs no database read, so
-    // the send pair still reaches the screen without waiting on the context
-    // query. History is screened in [_runSendGeneration], where a failure
-    // lands on the assistant message instead of rejecting the input.
-    if (!_supportsAudioAttachmentsForProvider(
-          settings,
-          providerKey: providerKey,
-          modelId: modelId,
-        ) &&
-        messageGenerationService.inputContainsAudioAttachments(input)) {
-      return ChatActionResult.error('audio_attachment_unsupported');
-    }
-
     late final ChatMessage userMessage;
     late final ChatMessage assistantMessage;
     String? generationRunId;
@@ -1369,16 +1316,6 @@ class ChatActions {
           if (message.id != userMessage.id && message.id != assistantMessage.id)
             message,
       ];
-      if (_hasUnsupportedAudioAttachments(
-        messages: existingContextMessages,
-        conversation: conversation,
-        settings: settings,
-        providerKey: providerKey,
-        modelId: modelId,
-        maxRawTruncateIndex: null,
-      )) {
-        throw const UnsupportedAudioAttachmentException();
-      }
 
       // Reset tool parts and initialize reasoning
       streamController.toolParts.remove(assistantMessage.id);
@@ -1386,7 +1323,12 @@ class ChatActions {
       final enableReasoning =
           supportsReasoning &&
           _isReasoningEnabled(
-            assistant?.thinkingBudget ?? settings.thinkingBudget,
+            _selectedReasoning(
+              settings: settings,
+              providerKey: providerKey,
+              modelId: modelId,
+              assistant: assistant,
+            ),
           );
       // Prepare API messages
       _bindFileProcessingCallbacks();
@@ -1672,24 +1614,6 @@ class ChatActions {
     final providerKey = modelConfig.providerKey!;
     final modelId = modelConfig.modelId!;
 
-    final projectedMessages = ChatActions.projectMessagesForRegenerationContext(
-      messages: completeMessages,
-      lastKeep: versioning.lastKeep,
-      targetGroupId: versioning.targetGroupId,
-    );
-    if (_hasUnsupportedAudioAttachments(
-      messages: projectedMessages,
-      conversation: isTemporaryConversation
-          ? conversation
-          : conversation.copyWith(truncateIndex: -1),
-      settings: settings,
-      providerKey: providerKey,
-      modelId: modelId,
-      maxRawTruncateIndex: versioning.lastKeep,
-    )) {
-      return ChatActionResult.error('audio_attachment_unsupported');
-    }
-
     if (shouldPhysicallyRemoveRegenerationTail(
       deleteTrailingEnabled: truncateFuture,
       isTemporaryConversation: isTemporaryConversation,
@@ -1788,7 +1712,12 @@ class ChatActions {
       final enableReasoning =
           supportsReasoning &&
           _isReasoningEnabled(
-            assistant?.thinkingBudget ?? settings.thinkingBudget,
+            _selectedReasoning(
+              settings: settings,
+              providerKey: providerKey,
+              modelId: modelId,
+              assistant: assistant,
+            ),
           );
       _bindFileProcessingCallbacks();
       try {
@@ -1954,7 +1883,12 @@ class ChatActions {
     final enableReasoning =
         supportsReasoning &&
         _isReasoningEnabled(
-          assistant?.thinkingBudget ?? settings.thinkingBudget,
+          _selectedReasoning(
+            settings: settings,
+            providerKey: providerKey,
+            modelId: modelId,
+            assistant: assistant,
+          ),
         );
 
     _bindFileProcessingCallbacks();
@@ -2091,7 +2025,10 @@ class ChatActions {
       streamController.markStreamingEnded(visibleStreaming.id);
       streamController.cleanupTimers(visibleStreaming.id);
       final cancelState = _streamingStates[visibleStreaming.id];
-      if (cancelState != null) _setRetryStatus(cancelState, null);
+      if (cancelState != null) {
+        cancelState.finishRequestTiming();
+        _setRetryStatus(cancelState, null);
+      }
       final index = _messages.indexWhere((m) => m.id == visibleStreaming.id);
       final visibleMessage = index == -1 ? visibleStreaming : _messages[index];
       if (chatController.publishTerminalMessage(visibleMessage)) {
@@ -2262,6 +2199,7 @@ class ChatActions {
         await _cancelSubscriptionWithTimeout(previousSub);
       }
 
+      state.requestStartedAt = DateTime.now();
       if (!ctx.streamOutput) {
         try {
           final result = await ChatApiService.generateMessage(
@@ -2269,8 +2207,12 @@ class ChatActions {
             modelId: ctx.modelId,
             messages: ctx.apiMessages,
             userImagePaths: ctx.userImagePaths,
-            thinkingBudget:
-                assistant?.thinkingBudget ?? ctx.settings.thinkingBudget,
+            reasoning: selectReasoningRequest(
+              settings: ctx.settings,
+              config: ctx.config,
+              modelId: ctx.modelId,
+              assistant: assistant,
+            ),
             temperature: assistant?.temperature,
             topP: assistant?.topP,
             maxTokens: assistant?.maxTokens,
@@ -2285,9 +2227,14 @@ class ChatActions {
             parseMarkdownImageLinks:
                 ctx.settings.sendMarkdownImageLinksAsImages,
             onRetry: (pending) => _setRetryStatus(state, pending),
+            onUsage: (update) {
+              state.partsHandler.handle(update);
+              _applyUsage(state);
+              _scheduleStreamingCheckpoint(state);
+            },
           );
+          state.finishRequestTiming();
           _setRetryStatus(state, null);
-          state.streamStartedAt ??= DateTime.now();
           await _markGenerationStreaming(state);
           state.partsHandler.handleResult(result);
           state.fullContentRaw = [
@@ -2298,7 +2245,7 @@ class ChatActions {
             for (final part in state.partsHandler.parts)
               if (part is ReasoningPart && part.text.isNotEmpty) part.text,
           ].join();
-          if (result.usage != null) _applyUsage(state, result.usage!);
+          _applyUsage(state);
           if (result.reasoningDetails != null) {
             streamController.setReasoningDetails(
               state.messageId,
@@ -2324,8 +2271,12 @@ class ChatActions {
         modelId: ctx.modelId,
         messages: ctx.apiMessages,
         userImagePaths: ctx.userImagePaths,
-        thinkingBudget:
-            assistant?.thinkingBudget ?? ctx.settings.thinkingBudget,
+        reasoning: selectReasoningRequest(
+          settings: ctx.settings,
+          config: ctx.config,
+          modelId: ctx.modelId,
+          assistant: assistant,
+        ),
         temperature: assistant?.temperature,
         topP: assistant?.topP,
         maxTokens: assistant?.maxTokens,
@@ -2342,6 +2293,7 @@ class ChatActions {
 
       final sub = listenSequentiallyToStream<StreamChunk>(
         stream: stream,
+        onReceived: state.recordFirstOutput,
         onData: (chunk) => _handleStreamChunk(chunk, state),
         onError: (error, stackTrace) => _handleStreamError(error, state),
         onDone: () => _handleStreamDone(state),
@@ -2403,8 +2355,9 @@ class ChatActions {
       case ServerToolEnd() || ToolCallResult() || Annotations():
         await _handleToolResultsChunk(chunk, state);
         _scheduleStreamingCheckpoint(state);
-      case Usage(:final usage):
-        _applyUsage(state, usage);
+      case Usage():
+        _applyUsage(state);
+        _scheduleStreamingCheckpoint(state);
       case ProviderArtifact(:final kind, :final payload):
         await chatService.setProviderArtifact(state.messageId, kind, payload);
       case Finish():
@@ -2426,9 +2379,9 @@ class ChatActions {
     }
   }
 
-  void _applyUsage(stream_ctrl.StreamingState state, TokenUsage usage) {
-    state.usage = (state.usage ?? const TokenUsage()).merge(usage);
-    state.totalTokens = state.usage!.totalTokens;
+  void _applyUsage(stream_ctrl.StreamingState state) {
+    state.usage = state.partsHandler.usage;
+    state.totalTokens = state.totalUsage?.totalTokens ?? 0;
   }
 
   Future<void> _markGenerationStreaming(
@@ -2544,7 +2497,6 @@ class ChatActions {
     final conversationId = state.conversationId;
 
     _recordContent(state, chunkContent);
-    state.streamStartedAt ??= DateTime.now();
 
     // End reasoning when content starts
     if (state.ctx.streamOutput && chunkContent.isNotEmpty) {
@@ -2567,10 +2519,10 @@ class ChatActions {
         partsBuilder: (visibleText) =>
             _assistantPartsForState(state, visibleText: visibleText),
         totalTokens: state.totalTokens,
-        promptTokens: state.usage?.promptTokens,
-        completionTokens: state.usage?.completionTokens,
-        cachedTokens: state.usage?.cachedTokens,
-        durationMs: _elapsedMsFrom(state.streamStartedAt),
+        promptTokens: state.totalUsage?.promptTokens,
+        completionTokens: state.totalUsage?.completionTokens,
+        cachedTokens: state.totalUsage?.cachedTokens,
+        durationMs: state.durationMs,
         updateMessageInList: (id, content, tokens) {
           onContentUpdated?.call(id, content, tokens);
         },
@@ -2648,6 +2600,7 @@ class ChatActions {
     stream_ctrl.StreamingState state, {
     bool generateTitle = true,
   }) async {
+    state.finishRequestTiming();
     final messageId = state.messageId;
     final conversationId = state.conversationId;
 
@@ -2681,10 +2634,12 @@ class ChatActions {
     final processedContent = _transformAssistantContent(state);
 
     // Compute final duration
-    final finalDurationMs = _elapsedMsFrom(state.streamStartedAt);
-    final finalPromptTokens = state.usage?.promptTokens;
-    final finalCompletionTokens = state.usage?.completionTokens;
-    final finalCachedTokens = state.usage?.cachedTokens;
+    final finalDurationMs = state.durationMs;
+    final finalPromptTokens = state.totalUsage?.promptTokens;
+    final finalCompletionTokens = state.totalUsage?.completionTokens;
+    final finalCachedTokens = state.totalUsage?.cachedTokens;
+    final finalReasoningTokens = state.totalUsage?.reasoningTokens;
+    final finalCacheWriteTokens = state.totalUsage?.cacheWriteTokens;
 
     // Flush final content to the streaming notifier before async operations.
     // This ensures any intermediate rebuild (e.g., from isProcessingFiles change
@@ -2711,8 +2666,28 @@ class ChatActions {
       promptTokens: finalPromptTokens,
       completionTokens: finalCompletionTokens,
       cachedTokens: finalCachedTokens,
+      reasoningTokens: finalReasoningTokens,
+      cacheWriteTokens: finalCacheWriteTokens,
       durationMs: finalDurationMs,
     );
+    final usage = state.usage;
+    final usageService = contextUsage;
+    if (usage != null && usageService != null) {
+      final assistant = state.ctx.assistant;
+      // Persisting the reply must not wait on usage bookkeeping.
+      unawaited(
+        usageService.recordUsage(
+          conversationId: conversationId,
+          providerKey: state.ctx.providerKey,
+          modelId: state.ctx.modelId,
+          assistantId: assistant is Assistant ? assistant.id : null,
+          usage: usage,
+          assistantMessage: finalizedMessage,
+          requestConfiguration: state.ctx.contextUsageConfiguration,
+          requestRevision: state.ctx.contextUsageRevision,
+        ),
+      );
+    }
     try {
       await _finalizeStreamingCheckpoint(
         finalizedMessage,
@@ -2771,6 +2746,7 @@ class ChatActions {
     )) {
       return;
     }
+    state.finishRequestTiming();
     state.finishHandled = true;
     final oauthFailure =
         e is ProviderOAuthException &&
@@ -2838,6 +2814,7 @@ class ChatActions {
 
   /// Handle stream done callback.
   Future<void> _handleStreamDone(stream_ctrl.StreamingState state) async {
+    state.finishRequestTiming();
     final conversationId = state.conversationId;
     final messageId = state.messageId;
 
