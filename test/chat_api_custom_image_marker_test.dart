@@ -78,10 +78,9 @@ Future<Map<String, dynamic>> _sendAndCaptureRequestBody(
 
 Future<Map<String, dynamic>> _captureStreamingChatBody({String? host}) async {
   late Map<String, dynamic> requestBody;
-  final server = await HttpServer.bind(
-    host == null ? InternetAddress.loopbackIPv4 : InternetAddress.loopbackIPv6,
-    0,
-  );
+  // Bind IPv4 to match how `*.localhost` resolves, otherwise the client
+  // dials 127.0.0.1 while the server only listens on [::1].
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   addTearDown(() async {
     await server.close(force: true);
   });

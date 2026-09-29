@@ -69,6 +69,7 @@ import 'setting/quick_phrases_pane.dart';
 import 'setting/instruction_injection_pane.dart';
 import 'setting/world_book_pane.dart';
 import 'setting/backup_pane.dart';
+import 'setting/axis_cloud_pane.dart';
 import 'setting/scheduled_tasks_pane.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart' show LucideIcons;
 import 'setting/hotkeys_pane.dart';
@@ -126,6 +127,8 @@ enum _SettingsMenuItem {
   memory,
   tts,
   networkProxy,
+  axisCloud,
+
   backup,
   scheduledTasks,
   hotkeys,
@@ -319,6 +322,10 @@ class _DesktopSettingsPageState extends State<DesktopSettingsPage> {
                           return const DesktopNetworkProxyPane(
                             key: ValueKey('networkProxy'),
                           );
+                        case _SettingsMenuItem.axisCloud:
+                          return const DesktopAxisCloudPane(
+                            key: ValueKey('axisCloud'),
+                          );
                         case _SettingsMenuItem.backup:
                           return const DesktopBackupPane(
                             key: ValueKey('backup'),
@@ -437,6 +444,11 @@ class _SettingsMenu extends StatelessWidget {
         _SettingsMenuItem.networkProxy,
         lucide.Lucide.EthernetPort,
         l10n.settingsPageNetworkProxy,
+      ),
+      (
+        _SettingsMenuItem.axisCloud,
+        lucide.Lucide.CloudSun,
+        l10n.axisCloudTitle,
       ),
       (
         _SettingsMenuItem.backup,

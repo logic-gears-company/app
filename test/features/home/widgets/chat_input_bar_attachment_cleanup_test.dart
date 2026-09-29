@@ -70,6 +70,16 @@ void main() {
   late Directory appSupportDir;
   late Directory userDir;
 
+  // El test de "el borrado del origen falla" provoca ese fallo con un
+  // directorio en modo 0555. Root puede borrar dentro de el igualmente porque
+  // DAC_OVERRIDE le ignora los permisos, asi que el borrado SIEMPRE tendria exito
+  // y no habria forma de observar el fallo que el test quiere comprobar. En CI
+  // el proceso corre como usuario normal, que es donde el escenario es real.
+  final runsAsRoot =
+      Platform.isLinux &&
+      Process.runSync('id', ['-u']).stdout.toString().trim() == '0';
+  final platformSupportsPosixModes = Platform.isMacOS || Platform.isLinux;
+
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
     previousPathProvider = PathProviderPlatform.instance;
@@ -1129,8 +1139,7 @@ void main() {
 
     controller.dispose();
     focusNode.dispose();
-  }, skip: !(Platform.isMacOS || Platform.isLinux));
-
+  }, skip: !platformSupportsPosixModes || runsAsRoot);
   testWidgets('压缩失败会记录日志且保留用户源文件', (tester) async {
     final logs = <String>[];
     final previousDebugPrint = debugPrint;

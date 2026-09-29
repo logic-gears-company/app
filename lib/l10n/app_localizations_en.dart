@@ -12761,4 +12761,50 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String get phoneControlEnableAssistant =>
       'Allow this assistant to use phone control';
+
+  @override
+  String get axisCloudTitle => 'AXIS Cloud';
+
+  @override
+  String get axisCloudAccount => 'Account';
+
+  @override
+  String get axisCloudSignOut => 'Sign out';
+
+  @override
+  String get axisCloudFiles => 'Files';
+
+  @override
+  String get axisCloudEmpty => 'No files yet in this folder';
+
+  @override
+  String get axisCloudLoading => 'Loading AXIS Cloud…';
+
+  @override
+  String get axisCloudSignInRequired => 'Sign in to AXIS to use AXIS Cloud';
+
+  @override
+  String get axisCloudRetry => 'Retry';
+
+  @override
+  String get axisCloudDownload => 'Download';
+
+  @override
+  String get axisCloudDelete => 'Delete';
+
+  @override
+  String get axisCloudDeleteConfirmTitle => 'Delete from AXIS Cloud?';
+
+  @override
+  String axisCloudDeleteConfirmBody(String name) {
+    return '$name will be removed from your AXIS account. This cannot be undone.';
+  }
+
+  @override
+  String get axisCloudUp => 'Up one level';
+
+  @override
+  String axisCloudUpdated(String when) {
+    return 'Updated $when';
+  }
 }

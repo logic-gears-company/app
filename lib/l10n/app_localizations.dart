@@ -22793,6 +22793,90 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Allow this assistant to use phone control'**
   String get phoneControlEnableAssistant;
+
+  /// No description provided for @axisCloudTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'AXIS Cloud'**
+  String get axisCloudTitle;
+
+  /// No description provided for @axisCloudAccount.
+  ///
+  /// In en, this message translates to:
+  /// **'Account'**
+  String get axisCloudAccount;
+
+  /// No description provided for @axisCloudSignOut.
+  ///
+  /// In en, this message translates to:
+  /// **'Sign out'**
+  String get axisCloudSignOut;
+
+  /// No description provided for @axisCloudFiles.
+  ///
+  /// In en, this message translates to:
+  /// **'Files'**
+  String get axisCloudFiles;
+
+  /// No description provided for @axisCloudEmpty.
+  ///
+  /// In en, this message translates to:
+  /// **'No files yet in this folder'**
+  String get axisCloudEmpty;
+
+  /// No description provided for @axisCloudLoading.
+  ///
+  /// In en, this message translates to:
+  /// **'Loading AXIS Cloud…'**
+  String get axisCloudLoading;
+
+  /// No description provided for @axisCloudSignInRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'Sign in to AXIS to use AXIS Cloud'**
+  String get axisCloudSignInRequired;
+
+  /// No description provided for @axisCloudRetry.
+  ///
+  /// In en, this message translates to:
+  /// **'Retry'**
+  String get axisCloudRetry;
+
+  /// No description provided for @axisCloudDownload.
+  ///
+  /// In en, this message translates to:
+  /// **'Download'**
+  String get axisCloudDownload;
+
+  /// No description provided for @axisCloudDelete.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete'**
+  String get axisCloudDelete;
+
+  /// No description provided for @axisCloudDeleteConfirmTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete from AXIS Cloud?'**
+  String get axisCloudDeleteConfirmTitle;
+
+  /// No description provided for @axisCloudDeleteConfirmBody.
+  ///
+  /// In en, this message translates to:
+  /// **'{name} will be removed from your AXIS account. This cannot be undone.'**
+  String axisCloudDeleteConfirmBody(String name);
+
+  /// No description provided for @axisCloudUp.
+  ///
+  /// In en, this message translates to:
+  /// **'Up one level'**
+  String get axisCloudUp;
+
+  /// No description provided for @axisCloudUpdated.
+  ///
+  /// In en, this message translates to:
+  /// **'Updated {when}'**
+  String axisCloudUpdated(String when);
 }
 
 class _AppLocalizationsDelegate
