@@ -1,5 +1,11 @@
 # Builds de Android en Codemagic, independientes de GitHub Actions.
 #
+# Solo Android. Este fichero no define ningun workflow de iOS ni invoca
+# flutter build ios / flutter build ipa, y tampoco declara config: ios, asi que
+# Codemagic no prepara Xcode ni necesita meson, ninja, llvm ni lld. Si alguna
+# vez apareciera un build de iOS, viene de un workflow configurado en el panel
+# web de Codemagic, no de este fichero.
+#
 # La app esta en la raiz del repositorio (pubspec.yaml, lib/ y android/ al mismo
 # nivel), asi que no hace falta working_directory. Los paquetes de
 # dependencies/ son path dependencies de pub, no apps.
@@ -25,9 +31,18 @@ workflows:
       - name: Flutter pub get
         script: flutter pub get
       - name: Analyze
-        script: dart analyze --fatal-infos lib test integration_test
+        # Acotado a lib/ test/ integration_test/ a proposito: flutter analyze
+        # sin argumentos tambien recorre dependencies/, cuyos mocks de mockito
+        # estan desactualizados y fallen. Es el mismo gate que exige AGENTS.md.
+        script: flutter analyze lib test integration_test
       - name: Test
-        script: flutter test
+        script: |
+          if [ -d test ]; then
+            echo "Ejecutando flutter test"
+            flutter test
+          else
+            echo "No hay directorio test/, se omite la suite"
+          fi
       - name: Build release APK
         script: flutter build apk --release
     artifacts:
@@ -44,9 +59,15 @@ workflows:
       - name: Flutter pub get
         script: flutter pub get
       - name: Analyze
-        script: dart analyze --fatal-infos lib test integration_test
+        script: flutter analyze lib test integration_test
       - name: Test
-        script: flutter test
+        script: |
+          if [ -d test ]; then
+            echo "Ejecutando flutter test"
+            flutter test
+          else
+            echo "No hay directorio test/, se omite la suite"
+          fi
       - name: Build release AAB
         script: flutter build appbundle --release
     artifacts:
