@@ -1,0 +1,173 @@
+name: Flutter Release Build
+
+# Empaqueta el APK/AAB de release en cada push a master, deja constancia de que
+# un PR compila, y permite relanzar el build a mano.
+#
+# Reparto con la CI que ya existe:
+#   - pr-check.yml  -> format, gen-l10n, untranslated, analyze y test en PRs.
+#     Este workflow NO repite analyze/test en pull_request: serian dos jobs
+#     identicos corriendo elAnalisis dos veces por PR.
+#   - build*.yml     -> builds multi-plataforma con firma, solo manual.
+#     Aqui no hay firma, porque el keystore no esta en el repositorio.
+#
+# La app no necesita ningun secreto para compilar: AXIS_BASE_URL tiene valor
+# por defecto en lib/core/services/axis_auth_service.dart. El input
+# axis_base_url solo existe para.pointar el build a otro servidor.
+
+env:
+  FLUTTER_VERSION: '3.44.9'
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_checks:
+        description: 'Ejecutar analyze y test antes de empaquetar'
+        type: boolean
+        default: true
+      build_aab:
+        description: 'Empaquetar tambien el App Bundle (.aab)'
+        type: boolean
+        default: false
+      axis_base_url:
+        description: 'URL de AXIS a embeber (vacio = valor por defecto del codigo)'
+        type: string
+        default: ''
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# En un PR solo interesa el commit mas reciente: cancelar los runs anteriores
+# ahorra minutos de runner sin tocar la build de master.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  release:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CI: 'true'
+      FLUTTER_SUPPRESS_ANALYTICS: 'true'
+      # El jniLibs de proot no esta en el repositorio; android/app/build.gradle.kts
+      # engancha fetchProot a preBuild y lo baja solo. No hace falta un paso aqui.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # AGP 8.11.1 exige JDK 17 para ejecutar Gradle, aunque el bytecode que
+      # genera la app siga siendo Java 11.
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # Cache propia de Gradle (dependencias, wrapper y configuration cache).
+      # subosito/flutter-action ya cachea el SDK y el pub cache; esto es la capa
+      # que falta para no re-resolver el classpath en cada build.
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Resolve build flags
+        id: flags
+        env:
+          AXIS: ${{ inputs.axis_base_url }}
+          RUN_CHECKS: ${{ inputs.run_checks }}
+        run: |
+          set -euo pipefail
+          # inputs.* llega vacio en push/pull_request, y ahi queremos los checks.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "checks=false" >> "$GITHUB_OUTPUT"
+          elif [ "$RUN_CHECKS" = "false" ]; then
+            echo "checks=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "checks=true" >> "$GITHUB_OUTPUT"
+          fi
+          # AXIS entra por env, no interpolado en el script: un input de
+          # workflow_dispatch es texto libre y no debe poder inyectar shell.
+          if [ -n "$AXIS" ]; then
+            echo "define=--dart-define=AXIS_BASE_URL=$AXIS" >> "$GITHUB_OUTPUT"
+          else
+            echo "define=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Analyze
+        if: steps.flags.outputs.checks == 'true'
+        run: dart analyze --fatal-infos lib test integration_test
+
+      - name: Test
+        if: steps.flags.outputs.checks == 'true'
+        run: flutter test
+
+      - name: Build release APK
+        run: flutter build apk --release ${{ steps.flags.outputs.define }}
+
+      - name: Verify release APK
+        id: apk
+        run: |
+          set -euo pipefail
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          if [ ! -s "$APK" ]; then
+            APK="$(find build/app/outputs/flutter-apk -maxdepth 1 -name '*.apk' -size +0 -print -quit)"
+          fi
+          if [ -z "${APK:-}" ] || [ ! -s "$APK" ]; then
+            echo "::error::flutter build apk no dejo ningun APK"
+            exit 1
+          fi
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-release-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+          # El APK ya viene comprimido; volver a comprimirlo solo gasta runner.
+          compression-level: 0
+
+      - name: Build release AAB
+        if: inputs.build_aab == 'true'
+        run: flutter build appbundle --release ${{ steps.flags.outputs.define }}
+
+      - name: Verify release AAB
+        id: aab
+        if: inputs.build_aab == 'true'
+        run: |
+          set -euo pipefail
+          AAB="build/app/outputs/bundle/release/app-release.aab"
+          if [ ! -s "$AAB" ]; then
+            AAB="$(find build/app/outputs/bundle -name '*.aab' -size +0 -print -quit)"
+          fi
+          if [ -z "${AAB:-}" ] || [ ! -s "$AAB" ]; then
+            echo "::error::flutter build appbundle no dejo ningun AAB"
+            exit 1
+          fi
+          echo "AAB=$AAB ($(du -h "$AAB" | cut -f1))"
+          echo "path=$AAB" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release AAB
+        if: inputs.build_aab == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-release-aab
+          path: ${{ steps.aab.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
