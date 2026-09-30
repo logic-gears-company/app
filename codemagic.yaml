@@ -1,0 +1,53 @@
+# Builds de Android en Codemagic, independientes de GitHub Actions.
+#
+# La app esta en la raiz del repositorio (pubspec.yaml, lib/ y android/ al mismo
+# nivel), asi que no hace falta working_directory. Los paquetes de
+# dependencies/ son path dependencies de pub, no apps.
+#
+# Sin firma: el keystore no esta en el repositorio y android/app/build.gradle.kts
+# solo engancha signingConfig si existe android/key.properties. El resultado es
+# un release sin firmar, igual que en GitHub Actions.
+#
+# Ningun secreto se necesita para compilar: AXIS_BASE_URL tiene valor por
+# defecto en lib/core/services/axis_auth_service.dart.
+
+name: Kelivo Android
+
+workflows:
+  android-release:
+    name: Android release APK
+    environment:
+      flutter: '3.44.9'
+    config:
+      android:
+        java_version: 17
+    scripts:
+      - name: Flutter pub get
+        script: flutter pub get
+      - name: Analyze
+        script: dart analyze --fatal-infos lib test integration_test
+      - name: Test
+        script: flutter test
+      - name: Build release APK
+        script: flutter build apk --release
+    artifacts:
+      - build/app/outputs/flutter-apk/*.apk
+
+  android-aab:
+    name: Android release AAB
+    environment:
+      flutter: '3.44.9'
+    config:
+      android:
+        java_version: 17
+    scripts:
+      - name: Flutter pub get
+        script: flutter pub get
+      - name: Analyze
+        script: dart analyze --fatal-infos lib test integration_test
+      - name: Test
+        script: flutter test
+      - name: Build release AAB
+        script: flutter build appbundle --release
+    artifacts:
+      - build/app/outputs/bundle/release/*.aab
